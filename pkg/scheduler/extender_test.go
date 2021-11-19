@@ -18,17 +18,19 @@ package scheduler
 
 import (
 	"context"
+	"k8s.io/kubernetes/pkg/scheduler/framework/fake"
 	"reflect"
 	"testing"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
+	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
@@ -387,4 +389,86 @@ func TestIsInterested(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRestoreNumPDBViolations test functions convertToNodeNameToMetaVictims and HTTPExtender.convertToNodeNameToVictims in HTTPExtender.ProcessPreemption
+// Ensure the NumPDBViolations of each node is returned from external server.
+func TestRestoreNumPDBViolations(t *testing.T) {
+	se := &HTTPExtender{}
+	nodes := []string{"node1", "node2"}
+	podsInNodeList := []*v1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod1", UID: "uid1"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod2", UID: "uid2"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod3", UID: "uid3"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pod4", UID: "uid4"}},
+	}
+
+	nodeInfoList := make([]*framework.NodeInfo, 0, len(nodes))
+	nodeNameToVictims := make(map[string]*extenderv1.Victims)
+	result := extenderv1.ExtenderPreemptionResult{
+		make(map[string]*extenderv1.MetaVictims),
+	}
+
+	// nodeNameToVictims{node1:{Pods: [pod1,pod3], NumPDBViolations: 1}, node2:{Pods: [pod2,pod4], NumPDBViolations: 2}}
+	// nodeInfoList[{node1:{Pods: pod1,pod3}}, {node2:{Pods: pod2,pod4}}]
+	// result.NodeNameToMetaVictims {node1:{MetaPod: [uid1,uid3], NumPDBViolations: 1}, node2:{MetaPod: [uid2,uid4], NumPDBViolations: 2}}
+	for i, nm := range nodes {
+		nodeInfo := framework.NewNodeInfo()
+		node := createNode(nm)
+		nodeInfo.SetNode(node)
+		nodeInfo.AddPod(podsInNodeList[i])
+		nodeInfo.AddPod(podsInNodeList[i+2])
+		nodeInfoList = append(nodeInfoList, nodeInfo)
+
+		victims := &extenderv1.Victims{NumPDBViolations: 1 + int64(i)}
+		victims.Pods = append(victims.Pods, podsInNodeList[i])
+		victims.Pods = append(victims.Pods, podsInNodeList[i+2])
+		nodeNameToVictims[nm] = victims
+
+		result.NodeNameToMetaVictims[nm] = &extenderv1.MetaVictims{NumPDBViolations: 1 + int64(i)}
+		result.NodeNameToMetaVictims[nm].Pods = append(result.NodeNameToMetaVictims[nm].Pods, &extenderv1.MetaPod{UID: string(podsInNodeList[i].UID)})
+		result.NodeNameToMetaVictims[nm].Pods = append(result.NodeNameToMetaVictims[nm].Pods, &extenderv1.MetaPod{UID: string(podsInNodeList[i+2].UID)})
+	}
+
+	for _, tc := range []struct {
+		label            string
+		nodeCacheCapable bool
+	}{
+		{
+			label:            "nodeCacheCapable enabled",
+			nodeCacheCapable: true,
+		},
+		{
+			label:            "nodeCacheCapable disenabled",
+			nodeCacheCapable: false,
+		},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+
+			// NodeCacheCapable enabled, check func convertToNodeNameToMetaVictims
+			// make sure  NumPDBViolations is transfered from nodeNameToVictims to nodeNameToMetaVictims
+			// Then the custom server should send it back to HTTPExtender, if it do not care or change it.
+			if tc.nodeCacheCapable {
+				nodeNameToMetaVictims := convertToNodeNameToMetaVictims(nodeNameToVictims)
+				for nm, victims := range nodeNameToVictims {
+					if victims.NumPDBViolations != nodeNameToMetaVictims[nm].NumPDBViolations {
+						t.Fatalf("convertToNodeNameToMetaVictims got node:%s NumPDBViolations:%d, want:%d ", nm, nodeNameToMetaVictims[nm].NumPDBViolations, victims.NumPDBViolations)
+					}
+				}
+			}
+
+			// Check func HTTPExtender.convertToNodeNameToVictims
+			// Make sure the NumPDBViolations is transfered from result.NodeNameToMetaVictims to newNodeNameToVictims
+			newNodeNameToVictims, err := se.convertToNodeNameToVictims(result.NodeNameToMetaVictims, fake.NodeInfoLister(nodeInfoList))
+			if err != nil {
+				t.Fatalf("HTTPExtender.convertToNodeNameToVictims got err:%v", err)
+			}
+			for nm, victims := range result.NodeNameToMetaVictims {
+				if victims.NumPDBViolations != newNodeNameToVictims[nm].NumPDBViolations {
+					t.Fatalf("HTTPExtender.convertToNodeNameToVictims got node:%s NumPDBViolations:%d, want:%d ", nm, newNodeNameToVictims[nm].NumPDBViolations, victims.NumPDBViolations)
+				}
+			}
+		})
+	}
+
 }

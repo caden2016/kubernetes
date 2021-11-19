@@ -217,7 +217,8 @@ func (h *HTTPExtender) convertToNodeNameToVictims(
 			return nil, err
 		}
 		victims := &extenderv1.Victims{
-			Pods: []*v1.Pod{},
+			Pods:             []*v1.Pod{},
+			NumPDBViolations: metaVictims.NumPDBViolations,
 		}
 		for _, metaPod := range metaVictims.Pods {
 			pod, err := h.convertPodUIDToPod(metaPod, nodeInfo)
@@ -254,7 +255,8 @@ func convertToNodeNameToMetaVictims(
 	nodeNameToMetaVictims := map[string]*extenderv1.MetaVictims{}
 	for node, victims := range nodeNameToVictims {
 		metaVictims := &extenderv1.MetaVictims{
-			Pods: []*extenderv1.MetaPod{},
+			Pods:             []*extenderv1.MetaPod{},
+			NumPDBViolations: victims.NumPDBViolations,
 		}
 		for _, pod := range victims.Pods {
 			metaPod := &extenderv1.MetaPod{
